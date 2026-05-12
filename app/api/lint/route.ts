@@ -159,15 +159,16 @@ function parseIssues(raw: string): LintIssue[] {
   }
   if (!parsed || !Array.isArray(parsed.issues)) return [];
   return parsed.issues
-    .map((i) => ({
-      word: String(i.word || '').trim(),
-      message: String(i.message || '').trim(),
-      suggestion: String(i.suggestion || '').trim(),
-      severity:
-        (String(i.severity || 'info').toLowerCase() as IssueSeverity) === 'warning'
-          ? 'warning'
-          : 'info',
-    }))
+    .map((i): LintIssue => {
+      const sev: IssueSeverity =
+        String(i.severity || 'info').toLowerCase() === 'warning' ? 'warning' : 'info';
+      return {
+        word: String(i.word || '').trim(),
+        message: String(i.message || '').trim(),
+        suggestion: String(i.suggestion || '').trim(),
+        severity: sev,
+      };
+    })
     .filter((i) => i.word.length > 0 && i.message.length > 0)
     .slice(0, 8);
 }
