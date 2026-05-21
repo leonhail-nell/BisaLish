@@ -179,7 +179,6 @@ async function callAnthropic(prompt: string): Promise<string> {
   const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server.');
 
-  const prefill = '{"issues":[';
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -190,10 +189,7 @@ async function callAnthropic(prompt: string): Promise<string> {
     body: JSON.stringify({
       model,
       max_tokens: 800,
-      messages: [
-        { role: 'user', content: prompt },
-        { role: 'assistant', content: prefill },
-      ],
+      messages: [{ role: 'user', content: prompt }],
     }),
   });
   if (!res.ok) {
@@ -203,8 +199,7 @@ async function callAnthropic(prompt: string): Promise<string> {
   const data = (await res.json()) as {
     content?: Array<{ type: string; text?: string }>;
   };
-  const text = data.content?.[0]?.text || '';
-  return prefill + text;
+  return data.content?.[0]?.text || '';
 }
 
 async function callOpenAI(prompt: string): Promise<string> {
