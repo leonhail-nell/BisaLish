@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type Anthropic from '@anthropic-ai/sdk';
+import { CachedAnthropic, placeBreakpoints, type CacheInfo } from 'prompt-cache-optimizer';
 
-export const runtime = 'edge'; // fast cold starts; switch to 'nodejs' if you need Node APIs
+// node runtime is required: prompt-cache-optimizer uses `node:crypto` for
+// segment fingerprinting, which the edge runtime does not expose.
+export const runtime = 'nodejs';
 
 // ----- Types -----
 export type Direction =
@@ -19,6 +23,15 @@ const VALID_DIRECTIONS: ReadonlySet<string> = new Set<Direction>([
   'english-to-nihongo',
   'nihongo-to-english',
 ]);
+
+const ALL_DIRECTIONS: Direction[] = [
+  'bisaya-to-english',
+  'english-to-bisaya',
+  'bisaya-to-nihongo',
+  'nihongo-to-bisaya',
+  'english-to-nihongo',
+  'nihongo-to-english',
+];
 
 export interface Suggestion {
   text: string;
@@ -103,11 +116,13 @@ function casualTip(target: Lang): string {
   return 'Use English contractions and casual word choices ("kinda", "wow", "totally", "y\'know").';
 }
 
-function buildPrompt(text: string, direction: Direction): string {
+// The SYSTEM prompt for a given direction. No per-request data — only the
+// (source, target) language pair, which is stable. This is the chunk Anthropic
+// will cache when we set a cache_control breakpoint at the end of it.
+function buildSystemPrompt(direction: Direction): string {
   const [sourceKey, , targetKey] = direction.split('-') as [Lang, string, Lang];
   const source = LANG_FULL_NAME[sourceKey];
   const target = LANG_FULL_NAME[targetKey];
-  const safeText = text.replace(/"/g, '\\"');
   return [
     'You are an expert translator working with Cebuano (Bisaya), English, and Japanese (when Japanese is requested, output romaji only).',
     '',
@@ -137,9 +152,24 @@ function buildPrompt(text: string, direction: Direction): string {
     '',
     'JSON shape (minified, no extra whitespace required):',
     '{"suggestions":[{"text":"...","tone":"natural"},{"text":"...","tone":"literal"},{"text":"...","tone":"formal"},{"text":"...","tone":"casual"},{"text":"...","tone":"concise"}]}',
-    '',
-    `Text to translate: "${safeText}"`,
   ].join('\n');
+}
+
+// Precompute once per cold start so each direction is a single shared string
+// reference and we never recompute it per request.
+const SYSTEM_BY_DIRECTION: Record<Direction, string> = Object.fromEntries(
+  ALL_DIRECTIONS.map((d) => [d, buildSystemPrompt(d)])
+) as Record<Direction, string>;
+
+function userMessageFor(text: string): string {
+  const safeText = text.replace(/"/g, '\\"');
+  return `Text to translate: "${safeText}"`;
+}
+
+// Used only for the OpenAI fallback — combines the two halves into a single
+// user message so we don't need to refactor OpenAI's response_format handling.
+function buildOpenAIPrompt(text: string, direction: Direction): string {
+  return `${SYSTEM_BY_DIRECTION[direction]}\n\n${userMessageFor(text)}`;
 }
 
 // ----- Response parsing -----
@@ -206,34 +236,54 @@ function parseSuggestions(raw: string): Suggestion[] {
 }
 
 // ----- Provider calls -----
-async function callAnthropic(prompt: string): Promise<string> {
+// Module-level singleton — see lint route for rationale.
+let cachedClient: CachedAnthropic | null = null;
+function getCachedClient(): CachedAnthropic {
+  if (cachedClient) return cachedClient;
   const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server.');
+  cachedClient = new CachedAnthropic({
+    apiKey,
+    warnIfHitRateBelow: 0.5,
+    hitRateWindow: 20,
+    onWarning: (e) => {
+      console.warn(`[translate cache] ${e.code}: ${e.message}`);
+    },
+  });
+  return cachedClient;
+}
+
+async function callAnthropic(text: string, direction: Direction): Promise<string> {
+  const client = getCachedClient();
   // Default to Sonnet for higher Cebuano fidelity (avoids Tagalog substitution).
   const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server.');
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 1200,
-      messages: [{ role: 'user', content: prompt }],
-    }),
+  const { system, messages } = placeBreakpoints({
+    system: SYSTEM_BY_DIRECTION[direction],
+    messages: [{ role: 'user', content: userMessageFor(text) }],
+    strategy: 'after-system',
   });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${errText.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as {
-    content?: Array<{ type: string; text?: string }>;
-  };
-  return data.content?.[0]?.text || '';
+  const response = await client.messages.create({
+    model,
+    max_tokens: 1200,
+    // placeBreakpoints uses a deliberately loose MessageParam type so it can
+    // accept either an SDK or hand-rolled payload. The runtime shape it
+    // returns is exactly what the SDK expects; cast to bridge the gap.
+    system: system as Anthropic.MessageCreateParamsNonStreaming['system'],
+    messages: messages as Anthropic.MessageParam[],
+  });
+
+  const info: CacheInfo = response.cacheInfo;
+  console.log(
+    `[translate cache] dir=${direction} hit=${info.hit} cachedTokens=${info.cachedTokens} ` +
+      `uncachedTokens=${info.uncachedTokens} cacheWrite=${info.cacheWriteTokens} ` +
+      `saved=$${info.dollarsSaved.toFixed(5)} spent=$${info.dollarsSpent.toFixed(5)}`
+  );
+
+  const block = response.content[0];
+  if (block && block.type === 'text') return block.text;
+  return '';
 }
 
 async function callOpenAI(prompt: string): Promise<string> {
@@ -281,7 +331,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid "direction".' }, { status: 400 });
     }
 
-    // Rate limit (best-effort; per edge instance)
+    // Rate limit (best-effort; per server instance)
     const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'unknown';
     const limit = Number(process.env.RATE_LIMIT_PER_MINUTE || 0);
     if (!checkRateLimit(ip, limit)) {
@@ -292,10 +342,11 @@ export async function POST(req: NextRequest) {
     }
 
     const provider = (process.env.AI_PROVIDER || 'anthropic').toLowerCase();
-    const prompt = buildPrompt(text, direction);
 
     const raw =
-      provider === 'openai' ? await callOpenAI(prompt) : await callAnthropic(prompt);
+      provider === 'openai'
+        ? await callOpenAI(buildOpenAIPrompt(text, direction))
+        : await callAnthropic(text, direction);
 
     const suggestions = parseSuggestions(raw);
     if (suggestions.length === 0) {
