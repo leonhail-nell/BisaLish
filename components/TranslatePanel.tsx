@@ -15,7 +15,14 @@ import SamplePhrases from './SamplePhrases';
 import SuggestionCard from './SuggestionCard';
 import BisayaCheckPanel from './BisayaCheckPanel';
 import type { Direction, LintIssue, Suggestion } from '../app/types';
-import { cacheKey, getCached, setCached } from '../app/storage';
+import {
+  cacheKey,
+  getCached,
+  setCached,
+  getTranslateQuota,
+  recordTranslateRequest,
+  type TranslateQuota,
+} from '../app/storage';
 
 interface Props {
   onFavoritesChanged?: () => void;
@@ -23,6 +30,18 @@ interface Props {
 
 const CHECK_TOGGLE_KEY = 'bisalish_check_enabled_v1';
 const LINT_DEBOUNCE_MS = 900;
+
+function formatResetIn(resetsAt: number): string {
+  if (!resetsAt) return 'soon';
+  const ms = resetsAt - Date.now();
+  if (ms <= 0) return 'in a moment';
+  const hours = Math.floor(ms / 3_600_000);
+  const minutes = Math.floor((ms % 3_600_000) / 60_000);
+  if (hours >= 1) {
+    return `in ${hours}h ${minutes}m`;
+  }
+  return `in ${Math.max(1, minutes)}m`;
+}
 
 export default function TranslatePanel({ onFavoritesChanged }: Props) {
   const [direction, setDirection] = React.useState<Direction>('bisaya-to-english');
@@ -40,6 +59,19 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
   const [lintError, setLintError] = React.useState<string | null>(null);
   const lintTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const lintReqIdRef = React.useRef(0);
+
+  // ---- Quota state ----
+  // Initialize empty so server-rendered HTML matches the client's first paint
+  // (localStorage isn't available during SSR). We hydrate in an effect below.
+  const [quota, setQuota] = React.useState<TranslateQuota>({
+    used: 0,
+    remaining: 0,
+    limit: 0,
+    resetsAt: 0,
+  });
+  React.useEffect(() => {
+    setQuota(getTranslateQuota());
+  }, []);
 
   // Load toggle from localStorage
   React.useEffect(() => {
@@ -137,12 +169,23 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
       const key = cacheKey(direction, text);
       const cached = getCached(key);
       if (cached) {
+        // Cache hits don't cost an API call, so they don't count against the
+        // daily quota.
         setSuggestions(cached);
         setSubmittedInput(text);
         setFromCache(true);
         setLoading(false);
         return;
       }
+
+      // Quota check ONLY for fresh (non-cached) requests.
+      const current = getTranslateQuota();
+      if (current.remaining <= 0) {
+        throw new Error(
+          `Daily limit reached (${current.limit}/${current.limit}). Try again later.`
+        );
+      }
+
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         throw new Error("You're offline and this phrase isn't cached yet.");
       }
@@ -161,6 +204,9 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
       setSuggestions(data.suggestions);
       setSubmittedInput(text);
       setFromCache(false);
+      // Only record AFTER a successful response so failed calls don't burn
+      // the user's quota.
+      setQuota(recordTranslateRequest());
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Translation failed.');
     } finally {
@@ -217,11 +263,25 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
             </Box>
           )}
 
+          {quota.limit > 0 && quota.remaining === 0 && (
+            <Alert severity="warning" sx={{ mt: 1.5 }}>
+              You&apos;ve used all {quota.limit} translations for today. The
+              counter resets {formatResetIn(quota.resetsAt)}. Cached phrases
+              still work.
+            </Alert>
+          )}
+          {quota.limit > 0 && quota.remaining > 0 && quota.used >= quota.limit - 1 && (
+            <Alert severity="info" sx={{ mt: 1.5 }}>
+              Heads up — {quota.remaining} of {quota.limit} translations left
+              today.
+            </Alert>
+          )}
+
           <Box sx={{ display: 'flex', gap: 1, mt: 1.5 }}>
             <Button
               variant="contained"
               color="primary"
-              disabled={loading}
+              disabled={loading || (quota.limit > 0 && quota.remaining === 0)}
               onClick={handleTranslate}
               sx={{ flex: 1, py: 1.1 }}
             >
@@ -234,6 +294,8 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
                   />
                   Translating…
                 </>
+              ) : quota.limit > 0 && quota.remaining === 0 ? (
+                'Daily limit reached'
               ) : (
                 'Translate'
               )}
@@ -242,6 +304,15 @@ export default function TranslatePanel({ onFavoritesChanged }: Props) {
               Clear
             </Button>
           </Box>
+
+          {quota.limit > 0 && (
+            <Typography
+              variant="caption"
+              sx={{ display: 'block', mt: 1, color: 'text.secondary', textAlign: 'right' }}
+            >
+              {quota.used}/{quota.limit} translations used today
+            </Typography>
+          )}
 
           {lintActive && (
             <BisayaCheckPanel
